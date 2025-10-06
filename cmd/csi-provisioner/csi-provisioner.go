@@ -60,8 +60,8 @@ import (
 	_ "k8s.io/component-base/metrics/prometheus/workqueue"               // register work queues in the default legacy registry
 	csitrans "k8s.io/csi-translation-lib"
 	"k8s.io/klog/v2"
-	"sigs.k8s.io/sig-storage-lib-external-provisioner/v12/controller"
-	libmetrics "sigs.k8s.io/sig-storage-lib-external-provisioner/v12/controller/metrics"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v13/controller"
+	libmetrics "sigs.k8s.io/sig-storage-lib-external-provisioner/v13/controller/metrics"
 
 	"github.com/kubernetes-csi/csi-lib-utils/leaderelection"
 	"github.com/kubernetes-csi/csi-lib-utils/metrics"
@@ -78,8 +78,11 @@ import (
 )
 
 var (
+	master               = flag.String("master", "", "Master URL to build a client config from. Either this or kubeconfig needs to be set if the provisioner is being run out of cluster.")
 	volumeNamePrefix     = flag.String("volume-name-prefix", "pvc", "Prefix to apply to the name of a created volume.")
 	volumeNameUUIDLength = flag.Int("volume-name-uuid-length", -1, "Truncates generated UUID of a created volume to this length. Defaults behavior is to NOT truncate.")
+	retryIntervalStart   = flag.Duration("retry-interval-start", time.Second, "Initial retry interval of failed provisioning or deletion. It doubles with each failure, up to retry-interval-max.")
+	retryIntervalMax     = flag.Duration("retry-interval-max", 5*time.Minute, "Maximum retry interval of failed provisioning or deletion.")
 	workerThreads        = flag.Uint("worker-threads", 100, "Number of provisioner worker threads, in other words nr. of simultaneous CSI calls.")
 	finalizerThreads     = flag.Uint("cloning-protection-threads", 1, "Number of simultaneously running threads, handling cloning finalizer removal")
 	capacityThreads      = flag.Uint("capacity-threads", 1, "Number of simultaneously running threads, handling CSIStorageCapacity objects")
@@ -91,6 +94,9 @@ var (
 	enableProfile       = flag.Bool("enable-pprof", false, "Enable pprof profiling on the TCP network address specified by --http-endpoint. The HTTP path is `/debug/pprof/`.")
 
 	defaultFSType = flag.String("default-fstype", "", "The default filesystem type of the volume to provision when fstype is unspecified in the StorageClass. If the default is not set and fstype is unset in the StorageClass, then no fstype will be set")
+
+	kubeAPICapacityQPS   = flag.Float32("kube-api-capacity-qps", 1, "QPS to use for storage capacity updates while communicating with the kubernetes apiserver. Defaults to 1.0.")
+	kubeAPICapacityBurst = flag.Int("kube-api-capacity-burst", 5, "Burst to use for storage capacity updates while communicating with the kubernetes apiserver. Defaults to 5.")
 
 	enableCapacity           = flag.Bool("enable-capacity", false, "This enables producing CSIStorageCapacity objects with capacity information from the driver's GetCapacity call.")
 	capacityImmediateBinding = flag.Bool("capacity-for-immediate-binding", false, "Enables producing capacity information for storage classes with immediate binding. Not needed for the Kubernetes scheduler, maybe useful for other consumers or for debugging.")
@@ -165,9 +171,9 @@ func main() {
 		standardflags.Configuration.KubeConfig = kubeconfigEnv
 	}
 
-	if standardflags.Configuration.Master != "" || standardflags.Configuration.KubeConfig != "" {
+	if *master != "" || standardflags.Configuration.KubeConfig != "" {
 		klog.Infof("Either master or kubeconfig specified. building kube config from that..")
-		config, err = clientcmd.BuildConfigFromFlags(standardflags.Configuration.Master, standardflags.Configuration.KubeConfig)
+		config, err = clientcmd.BuildConfigFromFlags(*master, standardflags.Configuration.KubeConfig)
 	} else {
 		klog.Infof("Building kube configs for running in cluster...")
 		config, err = rest.InClusterConfig()
@@ -373,8 +379,8 @@ func main() {
 
 	// -------------------------------
 	// PersistentVolumeClaims informer
-	genericRateLimiter := workqueue.NewTypedItemExponentialFailureRateLimiter[string](standardflags.Configuration.RetryIntervalStart, standardflags.Configuration.RetryIntervalMax)
-	claimRateLimiter := workqueue.NewTypedItemExponentialFailureRateLimiter[string](standardflags.Configuration.RetryIntervalStart, standardflags.Configuration.RetryIntervalMax)
+	genericRateLimiter := workqueue.NewTypedItemExponentialFailureRateLimiter[string](*retryIntervalStart, *retryIntervalMax)
+	claimRateLimiter := workqueue.NewTypedItemExponentialFailureRateLimiter[string](*retryIntervalStart, *retryIntervalMax)
 	claimQueue := workqueue.NewTypedRateLimitingQueueWithConfig(claimRateLimiter, workqueue.TypedRateLimitingQueueConfig[string]{Name: "claims"})
 	claimInformer := factory.Core().V1().PersistentVolumeClaims().Informer()
 
@@ -387,8 +393,7 @@ func main() {
 		controller.Threadiness(int(*workerThreads)),
 		controller.CreateProvisionedPVLimiter(workqueue.DefaultTypedControllerRateLimiter[string]()),
 		controller.ClaimsInformer(claimInformer),
-		controller.NodesLister(nodeLister),
-		controller.RetryIntervalMax(standardflags.Configuration.RetryIntervalMax),
+		controller.RetryIntervalMax(*retryIntervalMax),
 	}
 
 	if utilfeature.DefaultFeatureGate.Enabled(features.HonorPVReclaimPolicy) {
@@ -397,6 +402,10 @@ func main() {
 
 	if supportsMigrationFromInTreePluginName != "" {
 		provisionerOptions = append(provisionerOptions, controller.AdditionalProvisionerNames([]string{supportsMigrationFromInTreePluginName}))
+	}
+	var pvcNodeStore *ctrl.InMemoryStore
+	if ctrl.SupportsTopology(pluginCapabilities) {
+		pvcNodeStore = ctrl.NewInMemoryStore()
 	}
 
 	// Create the provisioner: it implements the Provisioner interface expected by
@@ -427,12 +436,15 @@ func main() {
 		nodeDeployment,
 		*controllerPublishReadOnly,
 		*preventVolumeModeConversion,
+		pvcNodeStore,
 	)
 
 	var capacityController *capacity.Controller
 	if *enableCapacity {
 		// Publishing storage capacity information uses its own client
 		// with separate rate limiting.
+		config.QPS = *kubeAPICapacityQPS
+		config.Burst = *kubeAPICapacityBurst
 		clientset, err := kubernetes.NewForConfig(config)
 		if err != nil {
 			klog.Fatalf("Failed to create client: %v", err)
@@ -464,7 +476,7 @@ func main() {
 
 		var topologyInformer topology.Informer
 		if nodeDeployment == nil {
-			topologyRateLimiter := workqueue.NewTypedItemExponentialFailureRateLimiter[string](standardflags.Configuration.RetryIntervalStart, standardflags.Configuration.RetryIntervalMax)
+			topologyRateLimiter := workqueue.NewTypedItemExponentialFailureRateLimiter[string](*retryIntervalStart, *retryIntervalMax)
 			topologyInformer = topology.NewNodeTopology(
 				provisionerName,
 				clientset,
@@ -530,7 +542,7 @@ func main() {
 			klog.Fatalf("unexpected error when checking for the V1 CSIStorageCapacity API: %v", err)
 		}
 
-		capacityRateLimiter := workqueue.NewTypedItemExponentialFailureRateLimiter[capacity.QueueKey](standardflags.Configuration.RetryIntervalStart, standardflags.Configuration.RetryIntervalMax)
+		capacityRateLimiter := workqueue.NewTypedItemExponentialFailureRateLimiter[capacity.QueueKey](*retryIntervalStart, *retryIntervalMax)
 		capacityController = capacity.NewCentralCapacityController(
 			csi.NewControllerClient(grpcClient),
 			provisionerName,
