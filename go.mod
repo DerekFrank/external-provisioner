@@ -1,12 +1,12 @@
 module github.com/kubernetes-csi/external-provisioner/v5
 
-go 1.24.2
+go 1.24.6
 
 require (
 	github.com/container-storage-interface/spec v1.11.0
 	github.com/golang/mock v1.6.0
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/kubernetes-csi/csi-lib-utils v0.22.0
+	github.com/kubernetes-csi/csi-lib-utils v0.23.0
 	github.com/kubernetes-csi/csi-test/v5 v5.3.1
 	github.com/kubernetes-csi/external-snapshotter/client/v8 v8.2.0
 	github.com/miekg/dns v1.1.68 // indirect
@@ -15,11 +15,11 @@ require (
 	github.com/stretchr/testify v1.11.1
 	google.golang.org/grpc v1.75.0
 	google.golang.org/protobuf v1.36.8
-	k8s.io/api v0.34.0
-	k8s.io/apimachinery v0.34.0
+	k8s.io/api v0.34.1
+	k8s.io/apimachinery v0.34.1
 	k8s.io/apiserver v0.34.0
-	k8s.io/client-go v0.34.0
-	k8s.io/component-base v0.34.0
+	k8s.io/client-go v0.34.1
+	k8s.io/component-base v0.34.1
 	k8s.io/component-helpers v0.34.0
 	k8s.io/csi-translation-lib v0.34.0
 	k8s.io/klog/v2 v2.130.1
